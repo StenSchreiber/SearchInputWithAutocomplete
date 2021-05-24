@@ -1,0 +1,506 @@
+<html>
+<head>
+	<script type="text/javascript">
+	var query_elem;
+	var out_elem;
+	var qb;
+
+	var QueryBuilder = function(fn_out) {
+
+		var that = this;
+
+		const LOG = false;
+
+		const states = {
+			default: "default",
+			error: "error",
+			field: "field",
+			operator: "operator",
+			value: "value",
+			connector: "connector",	
+		}
+
+		const errors = {
+			unknown_field: "unknown_field",
+			unknown_operator: "unknown_operator",
+			value_not_in_range: "value_not_in_range",
+			unknown_connector: "unknown_connector",
+		}
+
+		const connectors = ["AND", "OR"];
+
+
+		//v4 const TOKENIZER =  /(?!^) $|[\w%""]+|[=!<>]+/g;
+		const TOKENIZER =  /(?!^) $|[\w%]+|"[^"]+$|"[^"]+"|[=!<>]+|"+/g;
+		//v2 const TOKENIZER =  /(?!^) $|[\w]+|"[^"]+"|[=!]{1,2}/g;
+		//v1 const TOKENIZER =  /[^^] $|[\w]+|"[^"]+"|[=!]{1,2}/g;
+		///[\w]+|"[^"]+"|[=!]{1,2}/g
+		/// $|[\w]+|"[^"]+"|[=!]{1,2}/g;
+
+
+		var stack;
+		
+		var state;
+		var curr_field;
+		var curr_options;
+		var curr_errors;
+		var curr_state;
+		var curr_token;
+
+		function reset(){
+			state = states.default;
+			stack = new Array();
+			curr_field = null;
+			curr_options = null;
+			curr_errors = null;
+			curr_state = null;
+			curr_token = null;
+		}
+
+		function fsm_get_next_state(old_state, token) {
+					var new_state;
+				switch (old_state) {
+					case states.default:
+						new_state = states.field;
+						break;
+					case states.field:
+						new_state = states.operator;
+						break;
+					case states.operator:
+						new_state = states.value;
+						break;
+					case states.value:
+						new_state = states.connector;
+						break;				
+					case states.connector:
+						new_state = states.field;
+						break;						
+					default:
+						LOG && console.log("Unhandeled State in fsm_get_next_state");
+						new_state = states.error;
+				}
+				return new_state;
+		} 
+
+		function hlp_filter_fieldnames(allowed_fieldnames, token) {
+			token = (token == null) ? null : token.trim();
+			if (token) {
+				fff = allowed_fieldnames.filter(key => key.startsWith(token));
+			} else {
+				fff = allowed_fieldnames;
+			}
+			return fff;
+		}
+
+		function fsm_validate_token(state_to_check, field_context, token, is_step_completed) {
+			LOG && console.log("Validate: ",state_to_check, field_context, token, is_step_completed);
+			if (token != null) {
+				token = token.trim();
+			}
+			let has_error = false;
+			switch (state_to_check) {
+					case states.default:
+						break;
+					case states.field:
+						// check if field is in allowed fieldnames
+						let allowed_fieldnames = hlp_filter_fieldnames(Object.keys(options.field), token);
+						if (allowed_fieldnames.length == 0) {
+							has_error = errors.unknown_field;
+						}
+						if (is_step_completed && allowed_fieldnames.indexOf(token) == -1) {
+							has_error = errors.unknown_field;
+						}
+						break;
+					case states.operator:
+						if (field_context !== null && field_context != "") {
+							let allowed_fieldnames = hlp_filter_fieldnames(options.field[field_context].operator, token);
+							if (allowed_fieldnames.length == 0) {
+								has_error = errors.unknown_operator;
+							}
+							if (is_step_completed && allowed_fieldnames.indexOf(token) == -1) {
+								has_error = errors.unknown_operator;
+							}
+						}
+						break;
+					case states.value:
+						if (field_context !== null && field_context != "") {
+							let allow_list = options.field[field_context].value;
+							if (allow_list != null){
+								let allowed_fieldnames = hlp_filter_fieldnames(allow_list, token);
+								if (allowed_fieldnames.length == 0) {
+									has_error = errors.value_not_in_range;
+								}
+								if (is_step_completed && allowed_fieldnames.indexOf(token) == -1) {
+									has_error = errors.value_not_in_range;
+								}
+							} 
+						}
+						break;				
+					case states.connector:
+						let allowed_connectors = hlp_filter_fieldnames(connectors, token);
+						if (allowed_connectors.length == 0) {
+							has_error = errors.unknown_connector;
+						}
+						if (is_step_completed && allowed_connectors.indexOf(token) == -1) {
+							has_error = errors.unknown_connector	;
+						}
+						break;
+					case states.error:		
+						break;		
+					default:
+						LOG && console.log("Unhandeled State in fsm_validate_token");
+				}
+			return has_error;
+		}
+
+		function fsm_step(token, index, data) {
+			var is_last = (index == data.length - 1);
+			var is_step_completed = (!is_last && token != null && token.trim() != "");
+			LOG && console.log("------- INVOKE FSM STEP -------", token, is_step_completed, index, data, "Stack: ",stack);
+
+			let stack_word = stack.pop();
+			if (stack_word == "handle_not") {
+				LOG && console.log("Popping handle_not");
+				token = "not " + token;
+				is_step_completed = false;
+			} else if (stack_word == "handle_quotes" ) {
+				LOG && console.log("-------------Popping handle_quotes. New token:", token);
+				token = stack.pop() + " " + token;
+			} else {
+			// Get next state
+				state = fsm_get_next_state(state, token)
+			}
+
+			// handle not
+			if (state == states.operator && token == "not") {
+				stack.push("handle_not")
+				is_step_completed = false;
+				LOG && console.log("Pushing Not")
+			}
+
+			// handle quotes
+			if (state == states.value && token !== null) { 
+				token_match = token.match(/"/g)
+				quote_number = (token_match !== null) ? token_match.length : 0;
+				switch (quote_number) {
+					case 1: 
+						stack.push(token);
+						stack.push("handle_quotes");
+				// Replace ONLY first quote!
+						token = token.replace("\"", "");
+						LOG && console.log("------------------- Pushing quotes");
+						break;
+					case 2: 
+						LOG && console.log("Removing 2 quotes")
+						token = token.trim();
+						if ( token[0] == "\"" && token[token.length -1] == "\"") {
+							token = token.slice(1, -1);
+						}
+						break;
+					default:
+						LOG && console.log("Unhandeled quote_number.")
+				};
+			}
+
+			// Store current field context
+			switch (state) {
+					case states.field:
+						curr_field = token;
+						LOG && console.log("Storing field to consider", curr_field);
+						break;			
+					case states.connector:
+						curr_field = null;
+						break;						
+					default:
+						LOG && console.log("Unhandeled State in store current_field");
+			}
+
+			// Check for 
+			let has_error = fsm_validate_token(state, curr_field, token, is_step_completed)
+			if (has_error) {
+				state = states.error;
+				curr_errors = has_error;
+			};
+
+			curr_state = (state == states.default) ? states.field : state;
+			curr_token = token;
+
+			// Autocomplete Options
+			switch (curr_state) {
+					case states.field:
+						curr_options = hlp_filter_fieldnames(Object.keys(options.field), curr_token);
+						break;
+					case states.operator:
+						if (curr_field !== null && curr_field != "") {
+							curr_options = hlp_filter_fieldnames(options.field[curr_field].operator, curr_token);
+						}
+						break;
+					case states.value:
+						if (curr_field !== null && curr_field != "") {
+							var values = options.field[curr_field].value
+							curr_options = (values == null) ? null : hlp_filter_fieldnames(values, curr_token); 
+						}
+						break;				
+					case states.connector:
+						curr_options = hlp_filter_fieldnames(connectors, curr_token);
+						break;
+					case states.error:
+						curr_options = null; 
+						break;						
+					default:
+						LOG && console.log("Unhandeled State");
+						new_state = states.error;
+				}
+
+			// Logs
+			LOG && console.log(index + "=> State:", state)
+			LOG && console.log(index + "=> TOKEN:", token)
+			LOG && console.log(index + "=> FIELD: ", curr_field)
+			LOG && console.log(index + "=> STATE for UI", curr_state)
+			LOG && console.log(index + "=> Error for UI", curr_errors)
+	
+		}
+
+		var options = {
+			"field": { 
+				"season": {
+					"operator": ["==", "!=", "not like"],
+					"value": ["summer", "winter", "autumn", "spring"],
+				},
+				"color": {
+					"operator": ["==", "!=", "not like"],
+					"value": ["dark red", "dark green", "dark blue", "dark yellow", "dark brown"],
+				},
+				"id": {
+					"operator": ["==", "<>"],
+					"value": null,
+				},
+			},
+		}
+
+		return	{
+			input: function(data_str) {
+					//Reset FSM
+					reset();
+					
+					//Tokenize Input
+					data = data_str.match(TOKENIZER);
+					
+					// Call FSM
+					if (data != null) {
+						data.forEach(
+							(element, index, array) => fsm_step(element, index, data));
+					} else {
+						fsm_step(null, null, []);
+					}
+
+					if (curr_options == null) {
+						curr_options = [];
+					}
+
+					LOG && console.log("UI.State:", curr_state)
+					LOG && console.log("UI.Options:", curr_options)
+					LOG && console.log("UI.Errors: ", curr_errors)
+					LOG && console.log("UI.Token", curr_token)
+					fn_out(curr_state,curr_options,curr_errors,curr_token);
+
+				}
+		}
+
+	}
+
+	var on_input = function(event){
+		let value = query_elem.value;
+		value = value.slice(0, query_elem.selectionStart);
+		qb.input(value);
+	}
+
+	var on_start = function(event){
+		query_elem = document.getElementById("query");
+
+		query_elem.addEventListener("keydown", function(event){
+
+			if (event.key == "ArrowUp" || event.key == "ArrowDown" || event.key == "Tab" || event.key == "Enter") {
+				event.preventDefault();
+				let autocomplete = document.getElementById("autocomplete");
+				// find highlightet node
+				let hl = autocomplete.querySelector(".active");
+
+				if (hl == null) {
+					if (event.key == "ArrowUp") {
+						autocomplete.lastChild.classList.add("active");
+					} else if (event.key == "ArrowDown") {
+						autocomplete.firstChild.classList.add("active");
+					} 			
+				} else {
+					hl.classList.remove("active");
+
+					if (event.key == "ArrowUp") {
+						let prev = hl.previousSibling
+						if (prev == null) {
+							prev = autocomplete.lastChild;
+						}
+						prev.classList.add("active");
+					} else if (event.key == "ArrowDown") {
+						let next = hl.nextSibling;
+						if (next == null) {
+							next = autocomplete.firstChild;
+						}
+						next.classList.add("active");
+					} else if (event.key == "Tab"|| event.key == "Enter") {
+						hl.click();
+					}
+				}
+				// parent
+			}
+		});
+
+		qb = QueryBuilder(function(state, options, error, token){
+
+			var autocomplete = document.getElementById("autocomplete");
+			// Clean Nodes
+			while (autocomplete.firstChild) {
+        		autocomplete.removeChild(autocomplete.firstChild);
+    		}
+
+    		let is_visible = false;
+
+    		// Error output
+			if (error == null) {
+				options.forEach(function(element) {
+					let new_li = document.createElement("li");
+					new_li.textContent = element;
+					new_li.addEventListener("click", function(event){
+
+						// How many inputs to remove?
+						token_length = (token != null) ? token.trim().length : 0;
+
+						// remove last token
+						query_elem.value = query_elem.value.slice(0, query_elem.value.length - token_length);
+
+						//Handle 
+						if (state == "value" && element.indexOf(" ") !== -1) {
+							element = "\"" + element + "\"";
+						}
+
+						// if (token != null) {
+							// element = element.slice(token.trim().length);
+						// }
+						query_elem.value += element + " ";
+						query_elem.focus();
+						on_input();
+					});
+					
+					new_li.addEventListener("mouseover", function(event){
+						event.target.classList.add("active");
+					});
+					new_li.addEventListener("mouseout", function(event){	
+						event.target.classList.remove("active");
+					});
+
+					autocomplete.append(new_li);
+					is_visible = true;
+				});
+			} else {
+					let new_li = document.createElement("li");
+					new_li.textContent = "WARNING: An error occured: " + error;
+					autocomplete.append(new_li);
+					is_visible = true;
+			};
+			
+			if (is_visible) {
+				autocomplete.parentElement.classList.remove("hidden");
+			} else {
+				autocomplete.parentElement.classList.add("hidden");
+			}
+
+
+
+			document.getElementById("out_state").innerHTML = state;
+			document.getElementById("out_options").innerHTML = options;
+			document.getElementById("out_errors").innerHTML = error;
+			document.getElementById("out_token").innerHTML = "'" + token + "' (" + ((token != null) ? (token.length) : "NULL") + ")" ;
+
+		});
+
+		//qb.input("");
+
+		query_elem.addEventListener("input", on_input);
+		query_elem.addEventListener("focus", on_input);
+		query_elem.addEventListener("blur", function() { 
+				var autocomplete = document.getElementById("autocomplete")
+				setTimeout(function(){ 
+					if ( document.activeElement !== query_elem) {
+						autocomplete.parentElement.classList.add("hidden");
+					}
+				}, 300);
+			});
+
+		document.getElementById("debug_ctrl").addEventListener("change", function(){
+			document.getElementById("debug").classList.toggle("hidden");
+		});
+
+	}
+	document.addEventListener("DOMContentLoaded", on_start);
+	
+	</script>
+	<style>
+		#query {
+			width: 80%;
+		}
+		#autocomplete_div {
+			width: 80%;
+			border: solid 1px black;
+			position: absolute;
+			z-index: 300;
+			background: white;
+		}
+		#autocomplete {
+			margin: 0px;
+			padding: 5px;
+			list-style: none;
+		}
+		#autocomplete > li {
+			padding: 1px;
+		}
+		#autocomplete > li.active {
+			background: blue;
+			cursor: pointer;
+			color: white;
+		}
+
+		#debug_frm {
+			margin-top: 300px;
+		}
+
+		.hidden {
+			display: none;
+		}
+	</style>
+</head>
+<body>
+	<br />
+	<p>
+	<form>
+		<input id="query" autocomplete="off" value=""><input type="button" value="Search">
+
+		<div id="autocomplete_div" class="hidden">
+			<ul id="autocomplete"></ul>
+		</div>
+		<p>
+			Let's seach!
+		</p>
+	</form>
+			<span id="info"></span>
+	<form id="debug_frm">
+		<input id="debug_ctrl" type="checkbox"> Debug
+	</form>
+	<div id="debug" class="hidden">
+		Suggestions: <span id="out_options"></span><br/>
+		Occured errors: <span id="out_errors"></span><br/>
+		Your current token: <span id="out_token"></span><br/>
+		Your current state:<span id="out_state"></span><br/>
+	</div>
+	</p>
+</body>
+</html>
